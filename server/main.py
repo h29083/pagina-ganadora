@@ -31,6 +31,10 @@ CRYPTO_PRICE_USD = float(os.environ.get("CRYPTO_PRICE_USD", "5"))
 CRYPTO_SUCCESS_URL = os.environ.get("CRYPTO_SUCCESS_URL", "http://localhost:8000/static/success.html")
 COINBASE_COMMERCE_VERSION = "2018-03-22"
 
+# BTCPay (self-hosted payments, no external API keys needed from your app)
+BTCPAY_BUTTON_URL = os.environ.get("BTCPAY_BUTTON_URL", "")
+BTCPAY_WEBHOOK_SECRET = os.environ.get("BTCPAY_WEBHOOK_SECRET", "")
+
 stripe.api_key = STRIPE_SECRET
 
 app = FastAPI()
@@ -227,6 +231,45 @@ async def stripe_webhook(request: Request):
         email = session.get("customer_details", {}).get("email")
         with db() as conn:
             upsert_user_add_credits(conn, email, 200)
+    return {"received": True}
+
+
+@app.get("/btcpay/redirect")
+async def btcpay_redirect(email: Optional[str] = None):
+    if not BTCPAY_BUTTON_URL:
+        raise HTTPException(status_code=500, detail="BTCPay no configurado (BTCPAY_BUTTON_URL)")
+    # Redirecciona al Pay Button agregando buyerEmail si fue provisto
+    if email:
+        joiner = "&" if ("?" in BTCPAY_BUTTON_URL) else "?"
+        target = f"{BTCPAY_BUTTON_URL}{joiner}buyerEmail={email}"
+    else:
+        target = BTCPAY_BUTTON_URL
+    return JSONResponse({"url": target})
+
+
+@app.post("/btcpay/webhook")
+async def btcpay_webhook(request: Request):
+    raw = await request.body()
+    sig_header = request.headers.get("BTCPAY-SIG", "")
+    # Expected format: "sha256=<hex>"
+    expected = None
+    if BTCPAY_WEBHOOK_SECRET:
+        digest = hmac.new(BTCPAY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+        expected = f"sha256={digest}"
+        if not hmac.compare_digest(sig_header, expected):
+            raise HTTPException(status_code=400, detail="Firma BTCPay inválida")
+
+    evt = await request.json()
+    evt_type = evt.get("type") or (evt.get("event") or {}).get("type")
+    data = evt.get("invoice") or (evt.get("event") or {}).get("data") or {}
+    # buyerEmail puede venir en "metadata" o en el objeto buyer
+    meta = data.get("metadata") or {}
+    email = meta.get("buyerEmail") or meta.get("orderId") or (data.get("buyer") or {}).get("email")
+
+    if evt_type in ("InvoiceSettled", "InvoiceProcessing", "invoice_settled", "invoice_processing"):
+        if email:
+            with db() as conn:
+                upsert_user_add_credits(conn, email, 200)
     return {"received": True}
 
 
