@@ -9,7 +9,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import stripe
@@ -57,11 +57,18 @@ def db():
             email TEXT,
             api_key TEXT UNIQUE,
             credits INTEGER DEFAULT 0,
-            created_at TEXT
+            created_at TEXT,
+            purchases INTEGER DEFAULT 0
         )
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key)")
+    # Migration: ensure purchases column exists
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN purchases INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
     conn.commit()
     return conn
 
@@ -79,12 +86,12 @@ def upsert_user_add_credits(conn, email: Optional[str], add_credits: int) -> str
         cur = conn.execute("SELECT id, api_key FROM users WHERE email=?", (email,))
         row = cur.fetchone()
         if row:
-            conn.execute("UPDATE users SET credits = credits + ? WHERE id=?", (add_credits, row[0]))
+            conn.execute("UPDATE users SET credits = credits + ?, purchases = purchases + 1 WHERE id=?", (add_credits, row[0]))
             conn.commit()
             return row[1]
     conn.execute(
-        "INSERT INTO users(email, api_key, credits, created_at) VALUES (?,?,?,?)",
-        (email, api_key, add_credits, now),
+        "INSERT INTO users(email, api_key, credits, created_at, purchases) VALUES (?,?,?,?,?)",
+        (email, api_key, add_credits, now, 1 if add_credits > 0 else 0),
     )
     conn.commit()
     return api_key
@@ -118,13 +125,26 @@ async def key_by_email(email: Optional[str] = None):
     if not email:
         raise HTTPException(status_code=400, detail="Email requerido")
     with db() as conn:
-        cur = conn.execute("SELECT api_key, credits FROM users WHERE email=?", (email,))
+        cur = conn.execute("SELECT api_key, credits, purchases FROM users WHERE email=?", (email,))
         row = cur.fetchone()
         if row:
-            return {"api_key": row[0], "remaining": int(row[1]), "email": email}
+            return {"api_key": row[0], "remaining": int(row[1]), "purchases": int(row[2] or 0), "email": email}
         # Crear cuenta sin créditos si no existe
         api_key = upsert_user_add_credits(conn, email, 0)
-        return {"api_key": api_key, "remaining": 0, "email": email}
+        # Newly created with zero credits implies purchases=0
+        return {"api_key": api_key, "remaining": 0, "purchases": 0, "email": email}
+
+
+@app.get("/api/user-info")
+async def user_info(email: Optional[str] = None):
+    if not email:
+        raise HTTPException(status_code=400, detail="Email requerido")
+    with db() as conn:
+        cur = conn.execute("SELECT api_key, credits, purchases FROM users WHERE email=?", (email,))
+        row = cur.fetchone()
+        if not row:
+            return {"email": email, "api_key": None, "remaining": 0, "purchases": 0}
+        return {"email": email, "api_key": row[0], "remaining": int(row[1]), "purchases": int(row[2] or 0)}
 
 
 @app.post("/api/use-credits")
@@ -235,15 +255,25 @@ async def stripe_webhook(request: Request):
 
 
 @app.get("/btcpay/redirect")
-async def btcpay_redirect(email: Optional[str] = None):
+async def btcpay_redirect(request: Request, email: Optional[str] = None):
     if not BTCPAY_BUTTON_URL:
         raise HTTPException(status_code=500, detail="BTCPay no configurado (BTCPAY_BUTTON_URL)")
-    # Redirecciona al Pay Button agregando buyerEmail si fue provisto
-    if email:
-        joiner = "&" if ("?" in BTCPAY_BUTTON_URL) else "?"
-        target = f"{BTCPAY_BUTTON_URL}{joiner}buyerEmail={email}"
-    else:
-        target = BTCPAY_BUTTON_URL
+    if not email:
+        raise HTTPException(status_code=400, detail="Email requerido para comprar")
+    # Regla: si el usuario ya tiene créditos > 0, no permitir nueva compra aún
+    with db() as conn:
+        cur = conn.execute("SELECT credits FROM users WHERE email=?", (email,))
+        r = cur.fetchone()
+        if r and int(r[0]) > 0:
+            raise HTTPException(status_code=403, detail="Aún tienes créditos activos. Agota tus 200 envíos antes de volver a comprar.")
+    # Redirecciona al Pay Button agregando buyerEmail y redirect URL para auto redirigir tras el pago
+    base = str(request.base_url).rstrip('/')
+    postpay = f"{base}/static/postpay.html?email={email}"
+    joiner = "&" if ("?" in BTCPAY_BUTTON_URL) else "?"
+    target = (
+        f"{BTCPAY_BUTTON_URL}{joiner}buyerEmail={email}"
+        f"&redirectAutomatically=true&redirectURL={postpay}"
+    )
     return JSONResponse({"url": target})
 
 
@@ -271,6 +301,50 @@ async def btcpay_webhook(request: Request):
             with db() as conn:
                 upsert_user_add_credits(conn, email, 200)
     return {"received": True}
+
+
+@app.get("/download/client")
+async def download_client(email: Optional[str] = None):
+    """Build a zip containing BOTi.py and an instructions file.
+    If email is provided and exists, embed the API key into instructions for convenience.
+    """
+    import io, zipfile
+    api_key = None
+    with db() as conn:
+        if email:
+            cur = conn.execute("SELECT api_key FROM users WHERE email=?", (email,))
+            r = cur.fetchone()
+            if r:
+                api_key = r[0]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        # Include BOTi.py
+        try:
+            with open("BOTi.py", "rb") as f:
+                z.writestr("BOTi.py", f.read())
+        except Exception:
+            pass
+        # Include README/instructions
+        api_base = os.environ.get("API_BASE_URL", "https://pagina-ae85284c66a5.herokuapp.com")
+        instructions = f"""
+Form Auditor - Cliente
+
+1) Requisitos: Python 3.10+
+2) Ejecuta:
+   python BOTi.py --api-url {api_base} --api-key {api_key or '<TU_API_KEY>'} --times 5 --interval 3 https://tusitio.com/form
+
+Para ver tus créditos:
+   curl -H "Authorization: Bearer {api_key or '<TU_API_KEY>'}" {api_base}/api/credits
+
+Para recuperar tu API Key por email:
+   {api_base}/api/key-by-email?email={email or '<tu_correo>'}
+""".strip()
+        z.writestr("LEEME.txt", instructions)
+    buf.seek(0)
+    headers = {
+        "Content-Disposition": "attachment; filename=form_auditor_cliente.zip"
+    }
+    return StreamingResponse(buf, media_type="application/zip", headers=headers)
 
 
 class CryptoCheckoutBody(BaseModel):
